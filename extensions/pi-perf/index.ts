@@ -342,15 +342,19 @@ export default function (pi: ExtensionAPI) {
     const color = (name: string, text: string) => ctx.ui.theme?.fg?.(name, text) ?? text;
     const label = (text: string) => color("dim", text);
     // `Turn: TTFT 4.1s TPS 112.2 • Session: TTFT 5.6s TPS 156.3`. TPS is decode from a
-    // trustworthy source (Server-Timing, gateway anchor, clean event timing), `-` otherwise;
-    // end-to-end rates stay in the records and /perf.
-    const group = (name: string, ttft: number | null, decode: number | null) =>
+    // trustworthy source (Server-Timing, gateway anchor, clean event timing). When there is none
+    // (buffered burst, single event) the slot shows the end-to-end rate dimmed with an `e2e` tag
+    // rather than a number that would be delivery speed, not decode.
+    const tps = (decode: number | null, e2e: number | null) =>
+      decode !== null ? color("success", f1(decode)) : label(`${rate(e2e)} e2e`);
+    const group = (name: string, ttft: number | null, decode: number | null, e2e: number | null) =>
       `${label(`${name}:`)} ${label("TTFT")} ${color("accent", ttft === null ? "-" : `${f1(ttft)}s`)} ` +
-      `${label("TPS")} ${color("success", rate(decode))}`;
+      `${label("TPS")} ${tps(decode, e2e)}`;
     const latestDecode = trusted(latest.tpsSource) ? latest.decodeTps : null;
     ctx.ui.setStatus(
       "perf",
-      `${group("Turn", latest.ttftSec, latestDecode)} ${color("dim", "•")} ${group("Session", session.ttftSec, session.decodeTps)}`,
+      `${group("Turn", latest.ttftSec, latestDecode, div(latest.output, latest.sec))} ${color("dim", "•")} ` +
+      group("Session", session.ttftSec, session.decodeTps, session.tps),
     );
   };
   const finite = (value: unknown, fallback = 0) =>

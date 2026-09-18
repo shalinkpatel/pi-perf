@@ -7,9 +7,11 @@ import test from 'node:test';
 
 const { default: install } = await import(new URL('../extensions/pi-perf/index.ts', import.meta.url));
 
+// A decode value renders in success color; an `N e2e` fallback renders dim.
+const tpsCell = (v) => /e2e$/.test(v) ? `[dim]${v}[/dim]` : `[success]${v}[/success]`;
 const styledFooter = (turnTtft, turnDecode, sessionTtft, sessionDecode) =>
-  `[dim]Turn:[/dim] [dim]TTFT[/dim] [accent]${turnTtft}[/accent] [dim]TPS[/dim] [success]${turnDecode}[/success] [dim]•[/dim] ` +
-  `[dim]Session:[/dim] [dim]TTFT[/dim] [accent]${sessionTtft}[/accent] [dim]TPS[/dim] [success]${sessionDecode}[/success]`;
+  `[dim]Turn:[/dim] [dim]TTFT[/dim] [accent]${turnTtft}[/accent] [dim]TPS[/dim] ${tpsCell(turnDecode)} [dim]•[/dim] ` +
+  `[dim]Session:[/dim] [dim]TTFT[/dim] [accent]${sessionTtft}[/accent] [dim]TPS[/dim] ${tpsCell(sessionDecode)}`;
 
 function harness(t, options = {}) {
   let now = 1000;
@@ -157,7 +159,7 @@ test('single tool delta has TTFT but no decode interval', (t) => {
   assert.equal(r.effectiveTps, 5);
   assert.equal(r.tpsSource, 'e2e');
   assert.deepEqual([r.metricTokens, r.metricSec], [1, 0.2]);
-  assert.deepEqual(h.statuses.at(-1), ['perf', styledFooter('0.2s', '-', '0.2s', '-')]);
+  assert.deepEqual(h.statuses.at(-1), ['perf', styledFooter('0.2s', '5.0 e2e', '0.2s', '5.0 e2e')]);
 });
 
 test('buffered burst falls back to end-to-end TPS instead of dividing by dispatch jitter', (t) => {
@@ -177,7 +179,7 @@ test('buffered burst falls back to end-to-end TPS instead of dividing by dispatc
   assert.ok(r.effectiveTps < 100);
   const turn = h.records().find(r => r.type === 'turn');
   assert.equal(turn.decodeTps, null);
-  assert.match(h.statuses.at(-1)[1], /Turn:\S* \S*TTFT\S* \S*16\.0s\S* \S*TPS\S* \S*-\S* \S*•/);
+  assert.match(h.statuses.at(-1)[1], /Turn:\S* \S*TTFT\S* \S*16\.0s\S* \S*TPS\S* \S*43\.7 e2e\S* \S*•/);
   // A genuinely streamed short reply (11 tokens over 100 ms = 100 tok/s) keeps the events formula.
   const h2 = harness(t);
   h2.begin(1000);
@@ -212,7 +214,7 @@ test('a request delivered 3x faster than the model\'s running median is treated 
   const rs = h.records().filter(r => r.type === 'request');
   assert.deepEqual(rs.slice(0, 4).map(r => [r.buffered, Math.round(r.decodeTps)]), Array(4).fill([false, 100]));
   assert.deepEqual([rs[4].buffered, rs[4].tpsSource, Math.round(rs[4].effectiveTps)], [true, 'e2e', Math.round(945 / 16.7)]);
-  assert.match(h.statuses[4][1], /Turn:\S* \S*TTFT\S* \S*15\.3s\S* \S*TPS\S* \S*-\S* \S*•/); // buffered request has no trusted decode
+  assert.match(h.statuses[4][1], /Turn:\S* \S*TTFT\S* \S*15\.3s\S* \S*TPS\S* \S*56\.6 e2e\S* \S*•/); // buffered request has no trusted decode
   assert.deepEqual(rs.slice(5).map(r => [r.buffered, Math.round(r.decodeTps)]), Array(4).fill([false, 300]));
 });
 
