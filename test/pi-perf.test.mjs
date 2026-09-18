@@ -235,18 +235,6 @@ test('gateway sent-at anchors the decode window when a downstream proxy holds th
   assert.ok(Math.abs(r.decodeTps - 200 / 10.1) < 1e-9);
   assert.match(h.statuses.at(-1)[1], /Turn:\S* \S*TTFT\S* \S*11\.0s\S* \S*TPS\S* \S*19\.8\S* \S*•/);
 
-  // The HTTP Date header gives a 1 s-resolution lag estimate for origins without sent-at.
-  const h3 = harness(t);
-  h3.emit(1000, 'turn_start', { turnIndex: 0, timestamp: 1000 });
-  h3.emit(1000, 'before_provider_request', { payload: {} });
-  h3.emit(7800, 'after_provider_response', { status: 200, headers: { date: new Date(3000).toUTCString() } });
-  h3.update(7800, 'text_delta');
-  h3.update(7810, 'text_delta');
-  h3.finish(7810, 400);
-  const r3 = h3.records().find(r => r.type === 'request');
-  assert.equal(r3.headerLagFromDateSec, 4.8);
-  assert.equal(r3.tpsSource, 'e2e'); // Date is too coarse to anchor decode; diagnostic only
-
   // A sent-at outside our request window (clock skew or a stale header) is ignored.
   const h2 = harness(t);
   h2.emit(1000, 'turn_start', { turnIndex: 0, timestamp: 1000 });

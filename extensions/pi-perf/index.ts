@@ -46,7 +46,6 @@ interface ResponseAttempt {
   serverDecodeTps: number | null;
   serverReceivedAtMs: number | null;  // gateway accepted the request (epoch ms header)
   serverSentAtMs: number | null;      // gateway began forwarding the response, i.e. first token
-  dateHeaderMs: number | null;        // HTTP Date header (1 s resolution): when the origin emitted headers
 }
 interface ActiveRequest {
   turn: number;
@@ -491,7 +490,6 @@ export default function (pi: ExtensionAPI) {
       ...serverDecodeTiming(e.headers),
       serverReceivedAtMs: numericHeaderBySuffix(e.headers, ["received-at", "accepted-at"]),
       serverSentAtMs: numericHeaderBySuffix(e.headers, ["sent-at"]),
-      dateHeaderMs: (() => { const d = headerValueBySuffix(e.headers, "date"); const t = d ? Date.parse(d) : NaN; return Number.isFinite(t) ? t : null; })(),
     });
   });
 
@@ -550,12 +548,6 @@ export default function (pi: ExtensionAPI) {
     const serverTtftSec = sentAtTrusted && finalResponse?.serverReceivedAtMs ? (sentAt - finalResponse.serverReceivedAtMs) / 1000 : null;
     // How long the first byte took to reach us after the gateway sent it: a proxy hold shows up here.
     const headerDelaySec = sentAtTrusted && req.responseStartWallMs !== null ? (req.responseStartWallMs - sentAt) / 1000 : null;
-    // Same idea at 1 s resolution from the HTTP Date header, for origins without a sent-at header.
-    // Near zero on a buffered request means the origin held it; several seconds means this process
-    // saw the headers late (event loop stalled) while the origin had already sent them.
-    const dateMs = finalResponse?.dateHeaderMs ?? null;
-    const headerLagFromDateSec = dateMs !== null && req.responseStartWallMs !== null && dateMs >= req.startWallMs - 1500
-      ? Math.max(0, (req.responseStartWallMs - dateMs) / 1000) : null;
     // Prefer the gateway anchor for the decode window; fall back to the delta interval.
     const windowSec = anchoredSec !== null && anchoredSec > 0 ? anchoredSec : decodeSec;
     const windowSource: Req['tpsSource'] = anchoredSec !== null && anchoredSec > 0 ? 'anchored' : 'events';
@@ -614,7 +606,6 @@ export default function (pi: ExtensionAPI) {
       ttftSec,
       serverTtftSec,
       headerDelaySec,
-      headerLagFromDateSec,
       anchoredSec,
       eventItlMs,
       deltas: req.outputEvents,
