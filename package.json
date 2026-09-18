@@ -1,0 +1,28 @@
+{
+  "name": "pi-perf",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Per-request and per-turn TTFT, latency, and throughput metrics for Pi",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "performance",
+    "llm"
+  ],
+  "files": [
+    "extensions",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test test/pi-perf.test.mjs"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/pi-perf/index.ts"
+    ]
+  }
+}
