@@ -4,7 +4,7 @@
 //
 //   TPS               = output tokens / request latency (includes TTFT)
 //   decode TPS        = (output tokens - 1) / (request latency - TTFT)  [AIPerf]
-//   stream decode TPS = output tokens / (request latency - TTFT)        [Grafana-style]
+//   stream decode TPS = output tokens / (request latency - TTFT)        [no N-1 correction]
 //   active wall TPS   = output tokens / turn wall time excluding user-input waits
 //
 // Token counts are server-reported usage. Request = one provider call. Turn = one
@@ -12,16 +12,28 @@
 //
 // JSONL export is disabled by default. Enable it in ~/.pi/agent/settings.json:
 //   { "piPerf": { "log": { "enabled": true, "path": "pi-perf.jsonl", "includePayloads": false } } }
-// A trusted project's .pi/settings.json can override the same nested object. The
-// legacy "tps"."log" section remains supported; at the same scope, "piPerf" wins.
-// PI_PERF_LOG=/path/to/file.jsonl is a per-process override. PI_TPS_LOG remains
-// supported for compatibility. Both include payloads by default; set
-// PI_PERF_LOG_PAYLOADS=0 (or legacy PI_TPS_LOG_PAYLOADS=0) to disable payloads.
+// A trusted project's .pi/settings.json can override the same nested object.
+// PI_PERF_LOG=/path/to/file.jsonl is a per-process override; it includes payloads by
+// default, set PI_PERF_LOG_PAYLOADS=0 to disable them.
 // View history with /perf.
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
+
+// A proxy that holds a response and releases it compressed makes (output - 1) / decodeSec report
+// delivery speed, not decode speed: tens of thousands of tok/s for a single burst, or 3-6x the
+// model's real rate when the buffer drains over a second. Treat the events interval as buffered
+// when it exceeds an absolute cap or, once a model has a few samples, a multiple of that model's
+// running median; fall back to end-to-end for those requests.
+// ponytail: calibration knobs. Raise the cap for stacks that genuinely stream faster than this.
+const MAX_PLAUSIBLE_DECODE_TPS = 1000;
+const BUFFERED_MEDIAN_MULTIPLE = 2.5;
+const BUFFERED_MIN_SAMPLES = 3;
+// Server epoch headers are only trusted when they fall inside our own request window, which
+// bounds clock skew between the gateway and this machine to at most a round trip.
+const TRUSTED_SOURCES = new Set(["server", "anchored", "events"]);
+const trusted = (source: unknown) => typeof source === "string" && TRUSTED_SOURCES.has(source);
 
 interface ResponseAttempt {
   status: number;
@@ -30,6 +42,10 @@ interface ResponseAttempt {
   requestId: string | null;
   correlationId: string | null;
   traceparent: string | null;
+  serverDecodeMs: number | null;
+  serverDecodeTps: number | null;
+  serverReceivedAtMs: number | null;  // gateway accepted the request (epoch ms header)
+  serverSentAtMs: number | null;      // gateway began forwarding the response, i.e. first token
 }
 interface ActiveRequest {
   turn: number;
@@ -55,6 +71,13 @@ interface Req {
   deltas: number;
   decodeTps: number | null;
   streamDecodeTps: number | null;
+  effectiveTps: number | null;
+  // server: provider Server-Timing decode metric. anchored: gateway sent-at header to the last
+  // delta on our clock; immune to anything downstream of the gateway holding the stream.
+  // events: first to last delta on our clock. e2e: whole request latency.
+  tpsSource: "server" | "anchored" | "events" | "e2e" | null;
+  metricTokens: number;
+  metricSec: number;
 }
 interface Turn {
   reqs: number;
@@ -94,11 +117,128 @@ function headerValue(headers: Record<string, unknown>, names: string[]): string 
   return null;
 }
 
-function readLogSettings(path: string, baseDir: string, namespace: "piPerf" | "tps"): Partial<LogConfig> {
+function headerValueBySuffix(headers: Record<string, unknown>, suffix: string): string | null {
+  const normalizedSuffix = suffix.toLowerCase().replaceAll("_", "-");
+  const entries = Object.entries(headers).map(([key, value]) =>
+    [key.toLowerCase().replaceAll("_", "-"), value] as const);
+  for (const [key, value] of entries) {
+    if (key === normalizedSuffix && typeof value === "string" && value.length > 0) return value;
+  }
+  for (const [key, value] of entries) {
+    if (key.endsWith(`-${normalizedSuffix}`) && typeof value === "string" && value.length > 0) return value;
+  }
+  return null;
+}
+
+function numericHeaderBySuffix(headers: Record<string, unknown>, suffixes: string[]): number | null {
+  for (const suffix of suffixes) {
+    const value = headerValueBySuffix(headers, suffix);
+    if (value === null) continue;
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  return null;
+}
+
+const TOKEN_TIMING_STEMS = [
+  "llm-decode",
+  "model-decode",
+  "token-decode",
+  "llm-token-generation",
+  "model-token-generation",
+  "token-generation",
+];
+
+function splitOutsideQuotes(value: string, delimiter: string): string[] {
+  const parts: string[] = [];
+  let current = "";
+  let quoted = false;
+  let escaped = false;
+  for (const char of value) {
+    if (escaped) {
+      current += char;
+      escaped = false;
+      continue;
+    }
+    if (quoted) {
+      if (char === "\\") {
+        current += char;
+        escaped = true;
+      } else if (char === '"') {
+        quoted = false;
+        current += char;
+      } else {
+        current += char;
+      }
+      continue;
+    }
+    if (char === '"') {
+      quoted = true;
+      current += char;
+      continue;
+    }
+    if (char === delimiter) {
+      parts.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  const last = current.trim();
+  if (last.length > 0) parts.push(last);
+  return parts;
+}
+
+function unquoteHttpString(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length < 2 || !trimmed.startsWith('"') || !trimmed.endsWith('"')) return trimmed;
+  let result = "";
+  for (let i = 1; i < trimmed.length - 1; i++) {
+    if (trimmed[i] === "\\" && i + 1 < trimmed.length - 1) {
+      result += trimmed[i + 1];
+      i++;
+      continue;
+    }
+    result += trimmed[i];
+  }
+  return result;
+}
+
+function serverTimingMs(headers: Record<string, unknown>): number | null {
+  const value = headerValue(headers, ["server-timing"]);
+  if (!value) return null;
+  for (const stem of TOKEN_TIMING_STEMS) {
+    for (const entry of splitOutsideQuotes(value, ",")) {
+      const parts = splitOutsideQuotes(entry, ";");
+      const name = (parts.shift() ?? "").trim().toLowerCase().replaceAll("_", "-");
+      if (name !== stem) continue;
+      for (const param of parts) {
+        const equals = param.indexOf("=");
+        if (equals === -1) continue;
+        const key = param.slice(0, equals).trim().toLowerCase();
+        if (key !== "dur") continue;
+        const parsed = Number(unquoteHttpString(param.slice(equals + 1)));
+        if (Number.isFinite(parsed) && parsed > 0) return parsed;
+      }
+    }
+  }
+  return null;
+}
+
+function serverDecodeTiming(headers: Record<string, unknown>): Pick<ResponseAttempt, "serverDecodeMs" | "serverDecodeTps"> {
+  const durationSuffixes = TOKEN_TIMING_STEMS.flatMap((stem) => [`${stem}-duration-ms`, `${stem}-ms`]);
+  const tpsSuffixes = TOKEN_TIMING_STEMS.flatMap((stem) => [`${stem}-tokens-per-second`, `${stem}-tps`]);
+  return {
+    serverDecodeMs: numericHeaderBySuffix(headers, durationSuffixes) ?? serverTimingMs(headers),
+    serverDecodeTps: numericHeaderBySuffix(headers, tpsSuffixes),
+  };
+}
+
+function readLogSettings(path: string, baseDir: string): Partial<LogConfig> {
   try {
     const settings: unknown = JSON.parse(readFileSync(path, "utf8"));
-    if (!isObject(settings) || !isObject(settings[namespace])) return {};
-    const raw = settings[namespace].log;
+    if (!isObject(settings) || !isObject(settings.piPerf)) return {};
+    const raw = settings.piPerf.log;
     const rawLog: Record<string, unknown> = typeof raw === "boolean" ? { enabled: raw }
       : typeof raw === "string" ? { enabled: true, path: raw }
       : isObject(raw) ? raw
@@ -110,7 +250,6 @@ function readLogSettings(path: string, baseDir: string, namespace: "piPerf" | "t
       result.path = isAbsolute(expanded) ? expanded : join(baseDir, expanded);
     }
     if (typeof rawLog.includePayloads === "boolean") result.includePayloads = rawLog.includePayloads;
-    if (typeof rawLog.payloads === "boolean") result.includePayloads = rawLog.payloads;
     return result;
   } catch {
     // Missing or malformed settings must not break Pi. Pi reports malformed known
@@ -120,30 +259,20 @@ function readLogSettings(path: string, baseDir: string, namespace: "piPerf" | "t
 }
 
 function logConfig(ctx?: any): LogConfig {
-  const envPath = process.env.PI_PERF_LOG || process.env.PI_TPS_LOG;
+  const envPath = process.env.PI_PERF_LOG;
   if (envPath) {
-    const payloadSetting = process.env.PI_PERF_LOG_PAYLOADS ?? process.env.PI_TPS_LOG_PAYLOADS;
     return {
       enabled: true,
       path: expandTildePath(envPath),
-      includePayloads: payloadSetting !== "0",
+      includePayloads: process.env.PI_PERF_LOG_PAYLOADS !== "0",
     };
   }
   const agentDir = getAgentDir();
   const globalPath = join(agentDir, "settings.json");
-  // Legacy tps.log applies first; piPerf.log overrides it at the same scope.
-  let settings = {
-    ...readLogSettings(globalPath, agentDir, "tps"),
-    ...readLogSettings(globalPath, agentDir, "piPerf"),
-  };
+  let settings = readLogSettings(globalPath, agentDir);
   if (ctx?.isProjectTrusted?.()) {
     const projectDir = join(ctx.cwd, CONFIG_DIR_NAME);
-    const projectPath = join(projectDir, "settings.json");
-    settings = {
-      ...settings,
-      ...readLogSettings(projectPath, projectDir, "tps"),
-      ...readLogSettings(projectPath, projectDir, "piPerf"),
-    };
+    settings = { ...settings, ...readLogSettings(join(projectDir, "settings.json"), projectDir) };
   }
   return {
     enabled: settings.enabled === true,
@@ -160,29 +289,46 @@ export default function (pi: ExtensionAPI) {
   let runStartWall = 0;
   let cur: Turn | undefined;
   let active: ActiveRequest | undefined;
+  let pendingClientRequestId: string | null = null;
+  let pendingClientCorrelationId: string | null = null;
   let userWaitStartPerf: number | null = null;
+  const eventRatesByModel = new Map<string, number[]>();
+  const looksBuffered = (model: string, rate: number) => {
+    const rates = eventRatesByModel.get(model) ?? [];
+    const sorted = [...rates].sort((a, b) => a - b);
+    const median = sorted.length >= BUFFERED_MIN_SAMPLES ? sorted[Math.floor(sorted.length / 2)] : null;
+    rates.push(rate);
+    eventRatesByModel.set(model, rates);
+    return rate > MAX_PLAUSIBLE_DECODE_TPS || (median !== null && rate > BUFFERED_MEDIAN_MULTIPLE * median);
+  };
 
   const session = (ctx: any) => {
-    try { return ctx.sessionManager?.getSessionFile?.() ?? ctx.sessionManager?.sessionId; } catch { return undefined; }
+    try { return ctx.sessionManager?.getSessionFile?.() ?? ctx.sessionManager?.getSessionId?.(); } catch { return undefined; }
   };
   const sessionStats = () => {
     let ttftSec = 0;
     let ttftCount = 0;
-    let decodeSec = 0;
-    let decodeTokens = 0;
+    let metricSec = 0;
+    let metricTokens = 0;
+    let sec = 0;
+    let output = 0;
     for (const req of reqs) {
-      if (req.ttftSec === null) continue;
-      ttftSec += req.ttftSec;
-      ttftCount++;
-      const reqDecodeSec = req.sec - req.ttftSec;
-      if (reqDecodeSec > 0 && req.output > 1) {
-        decodeSec += reqDecodeSec;
-        decodeTokens += req.output - 1;
+      if (req.ttftSec !== null) {
+        ttftSec += req.ttftSec;
+        ttftCount++;
+      }
+      sec += req.sec;
+      output += req.output;
+      // Decode aggregates only trust server or clean event timing; e2e fallbacks are excluded.
+      if (trusted(req.tpsSource) && req.metricSec > 0 && req.metricTokens > 0) {
+        metricSec += req.metricSec;
+        metricTokens += req.metricTokens;
       }
     }
     return {
       ttftSec: ttftCount > 0 ? ttftSec / ttftCount : null,
-      decodeTps: decodeSec > 0 && decodeTokens > 0 ? decodeTokens / decodeSec : null,
+      tps: div(output, sec),
+      decodeTps: metricSec > 0 && metricTokens > 0 ? metricTokens / metricSec : null,
     };
   };
   const updateFooterStatus = (ctx: any) => {
@@ -195,13 +341,19 @@ export default function (pi: ExtensionAPI) {
     const color = (name: string, text: string) => ctx.ui.theme?.fg?.(name, text) ?? text;
     const label = (text: string) => color("dim", text);
     const separator = color("dim", "•");
+    // Headline is decode TPS from a trustworthy source (Server-Timing, gateway anchor, or clean
+    // event timing), n/a otherwise. End-to-end TPS (tokens / request latency, immune to stream
+    // buffering) always follows in parentheses.
+    const tps = (decode: number | null, e2e: number | null) =>
+      `${color("success", rate(decode))} ${label(`(e2e ${rate(e2e)})`)}`;
+    const latestDecode = trusted(latest.tpsSource) ? latest.decodeTps : null;
     ctx.ui.setStatus(
       "perf",
       [
         `${label("Turn TTFT:")} ${color("accent", seconds(latest.ttftSec))}`,
-        `${label("Turn TPS:")} ${color("success", rate(latest.decodeTps))}`,
+        `${label("Turn TPS:")} ${tps(latestDecode, div(latest.output, latest.sec))}`,
         `${label("Session TTFT:")} ${color("accent", seconds(session.ttftSec))}`,
-        `${label("Session TPS:")} ${color("success", rate(session.decodeTps))}`,
+        `${label("Session TPS:")} ${tps(session.decodeTps, session.tps)}`,
       ].join(` ${separator} `),
     );
   };
@@ -213,23 +365,22 @@ export default function (pi: ExtensionAPI) {
   const restoreFromSession = (ctx: any) => {
     reqs.length = 0;
     turns.length = 0;
-    const chain: any[] = [];
-    let id = ctx.sessionManager?.getLeafId?.();
-    while (id) {
-      const entry = ctx.sessionManager?.getEntry?.(id);
-      if (!entry) break;
-      chain.unshift(entry);
-      id = entry.parentId;
-    }
-    for (const entry of chain) {
+    for (const entry of ctx.sessionManager?.getBranch?.() ?? []) {
       if (entry.type !== "custom") continue;
       const data = entry.data;
       if (!isObject(data)) continue;
-      if (entry.customType === "perf_request" || entry.customType === "tps_request") {
+      if (entry.customType === "perf_request") {
         const output = finite(data.output);
-        const sec = finite(data.sec ?? data.latencySec);
+        const sec = finite(data.sec);
         const ttftSec = nullableFinite(data.ttftSec);
         const decodeSec = ttftSec === null ? null : sec - ttftSec;
+        const eventDecodeTps = decodeSec !== null && decodeSec > 0 && output > 1 && (output - 1) / decodeSec <= MAX_PLAUSIBLE_DECODE_TPS
+          ? (output - 1) / decodeSec : null;
+        const decodeTps = nullableFinite(data.decodeTps) ?? eventDecodeTps;
+        const effectiveTps = nullableFinite(data.effectiveTps) ?? decodeTps ?? div(output, sec);
+        const tpsSource = trusted(data.tpsSource) || data.tpsSource === "e2e"
+          ? data.tpsSource as Req["tpsSource"]
+          : decodeTps !== null ? "events" : effectiveTps !== null ? "e2e" : null;
         reqs.push({
           turn: finite(data.turn, -1),
           input: finite(data.input),
@@ -237,14 +388,17 @@ export default function (pi: ExtensionAPI) {
           output,
           sec,
           ttftSec,
-          eventItlMs: nullableFinite(data.eventItlMs ?? data.itlMs),
+          eventItlMs: nullableFinite(data.eventItlMs),
           deltas: finite(data.deltas),
-          decodeTps: nullableFinite(data.decodeTps) ??
-            (decodeSec !== null && decodeSec > 0 && output > 1 ? (output - 1) / decodeSec : null),
-          streamDecodeTps: nullableFinite(data.streamDecodeTps) ??
-            (decodeSec !== null && decodeSec > 0 && output > 0 ? output / decodeSec : null),
+          decodeTps,
+          streamDecodeTps: "streamDecodeTps" in data ? nullableFinite(data.streamDecodeTps)
+            : eventDecodeTps !== null && decodeSec !== null ? output / decodeSec : null,
+          effectiveTps,
+          tpsSource,
+          metricTokens: nullableFinite(data.metricTokens) ?? (decodeTps !== null && decodeSec !== null ? output - 1 : output),
+          metricSec: nullableFinite(data.metricSec) ?? (decodeTps !== null && decodeSec !== null ? decodeSec : sec),
         });
-      } else if (entry.customType === "perf_turn" || entry.customType === "tps_turn") {
+      } else if (entry.customType === "perf_turn") {
         const wallSec = finite(data.wallSec);
         turns.push({
           reqs: finite(data.reqs),
@@ -264,11 +418,14 @@ export default function (pi: ExtensionAPI) {
   const writeLog = (rec: object, ctx?: any) => {
     const config = logConfig(ctx);
     if (!config.enabled) return;
-    mkdirSync(dirname(config.path), { recursive: true });
-    appendFileSync(config.path, JSON.stringify(rec) + "\n");
+    try {
+      mkdirSync(dirname(config.path), { recursive: true });
+      appendFileSync(config.path, JSON.stringify(rec) + "\n");
+    } catch {}
   };
 
   pi.on("session_start", (_e, ctx) => restoreFromSession(ctx));
+  pi.on("session_tree", (_e, ctx) => restoreFromSession(ctx));
 
   let sysLogged = false;
   pi.on("before_agent_start", (_e, ctx) => {
@@ -290,10 +447,12 @@ export default function (pi: ExtensionAPI) {
       firstOutputPerfMs: null,
       lastOutputPerfMs: null,
       outputEvents: 0,
-      clientRequestId: null,
-      clientCorrelationId: null,
+      clientRequestId: pendingClientRequestId,
+      clientCorrelationId: pendingClientCorrelationId,
       responses: [],
     };
+    pendingClientRequestId = null;
+    pendingClientCorrelationId = null;
     const config = logConfig(ctx);
     if (config.includePayloads) {
       writeLog({ type: "provider_request", session: session(ctx), turn: turnIdx, startWallMs, payload: e.payload }, ctx);
@@ -301,9 +460,16 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_provider_headers", (e) => {
-    if (!active) return;
-    active.clientRequestId = headerValue(e.headers, ["x-request-id", "request-id"]);
-    active.clientCorrelationId = headerValue(e.headers, ["x-correlation-id", "correlation-id"]);
+    const requestId = headerValueBySuffix(e.headers, "request-id");
+    const correlationId = headerValueBySuffix(e.headers, "correlation-id");
+    if (active) {
+      active.clientRequestId = requestId;
+      active.clientCorrelationId = correlationId;
+      return;
+    }
+    // Pi emits headers before before_provider_request; hold them until the request opens.
+    pendingClientRequestId = requestId;
+    pendingClientCorrelationId = correlationId;
   });
 
   pi.on("after_provider_response", (e) => {
@@ -318,9 +484,12 @@ export default function (pi: ExtensionAPI) {
       status: e.status,
       atWallMs,
       atPerfMs,
-      requestId: headerValue(e.headers, ["x-request-id", "request-id"]),
-      correlationId: headerValue(e.headers, ["x-correlation-id", "correlation-id"]),
-      traceparent: headerValue(e.headers, ["traceparent"]),
+      requestId: headerValueBySuffix(e.headers, "request-id"),
+      correlationId: headerValueBySuffix(e.headers, "correlation-id"),
+      traceparent: headerValueBySuffix(e.headers, "traceparent"),
+      ...serverDecodeTiming(e.headers),
+      serverReceivedAtMs: numericHeaderBySuffix(e.headers, ["received-at", "accepted-at"]),
+      serverSentAtMs: numericHeaderBySuffix(e.headers, ["sent-at"]),
     });
   });
 
@@ -370,9 +539,43 @@ export default function (pi: ExtensionAPI) {
     const eventItlMs = req.outputEvents > 1 && lastOutputPerfMs !== null && req.firstOutputPerfMs !== null
       ? (lastOutputPerfMs - req.firstOutputPerfMs) / (req.outputEvents - 1)
       : null;
-    const decodeTps = decodeSec !== null && decodeSec > 0 && output > 1 ? (output - 1) / decodeSec : null;
-    const streamDecodeTps = decodeSec !== null && decodeSec > 0 && output > 0 ? output / decodeSec : null;
     const finalResponse = req.responses.at(-1);
+    const lastOutputWallMs = lastOutputPerfMs === null ? null : req.startWallMs + (lastOutputPerfMs - req.startPerfMs);
+    const sentAt = finalResponse?.serverSentAtMs ?? null;
+    const sentAtTrusted = sentAt !== null && req.responseStartWallMs !== null
+      && sentAt >= req.startWallMs && sentAt <= req.responseStartWallMs;
+    const anchoredSec = sentAtTrusted && lastOutputWallMs !== null ? (lastOutputWallMs - sentAt) / 1000 : null;
+    const serverTtftSec = sentAtTrusted && finalResponse?.serverReceivedAtMs ? (sentAt - finalResponse.serverReceivedAtMs) / 1000 : null;
+    // How long the first byte took to reach us after the gateway sent it: a proxy hold shows up here.
+    const headerDelaySec = sentAtTrusted && req.responseStartWallMs !== null ? (req.responseStartWallMs - sentAt) / 1000 : null;
+    // Prefer the gateway anchor for the decode window; fall back to the delta interval.
+    const windowSec = anchoredSec !== null && anchoredSec > 0 ? anchoredSec : decodeSec;
+    const windowSource: Req['tpsSource'] = anchoredSec !== null && anchoredSec > 0 ? 'anchored' : 'events';
+    const buffered = windowSec !== null && windowSec > 0 && output > 1
+      && looksBuffered(String(e.message.model ?? ""), (output - 1) / windowSec);
+    const eventDecodeTps = windowSec !== null && windowSec > 0 && output > 1 && !buffered ? (output - 1) / windowSec : null;
+    const streamDecodeTps = windowSec !== null && windowSec > 0 && output > 0 && !buffered ? output / windowSec : null;
+    let decodeTps = eventDecodeTps;
+    let tpsSource: Req['tpsSource'] = eventDecodeTps !== null ? windowSource : null;
+    let metricTokens = eventDecodeTps !== null ? output - 1 : 0;
+    let metricSec = eventDecodeTps !== null && windowSec !== null ? windowSec : 0;
+    if (finalResponse?.serverDecodeTps && finalResponse.serverDecodeTps > 0 && output > 0) {
+      decodeTps = finalResponse.serverDecodeTps;
+      tpsSource = 'server';
+      metricTokens = output;
+      metricSec = output / finalResponse.serverDecodeTps;
+    } else if (finalResponse?.serverDecodeMs && finalResponse.serverDecodeMs > 0 && output > 0) {
+      metricSec = finalResponse.serverDecodeMs / 1000;
+      metricTokens = output;
+      decodeTps = output / metricSec;
+      tpsSource = 'server';
+    }
+    if (tpsSource === null) {
+      metricTokens = output;
+      metricSec = sec;
+      tpsSource = sec > 0 && output > 0 ? 'e2e' : null;
+    }
+    const effectiveTps = metricSec > 0 && metricTokens > 0 ? metricTokens / metricSec : null;
 
     const record = {
       type: "request",
@@ -398,36 +601,33 @@ export default function (pi: ExtensionAPI) {
       cacheRead: u.cacheRead ?? 0,
       output,
       sec,
-      latencySec: sec,
       ttftSec,
+      serverTtftSec,
+      headerDelaySec,
+      anchoredSec,
       eventItlMs,
       deltas: req.outputEvents,
+      buffered,
       tps: div(output, sec),
       decodeTps,
       streamDecodeTps,
+      effectiveTps,
+      tpsSource,
+      metricTokens,
+      metricSec,
     };
-    const summary: Req = {
-      turn: req.turn,
-      input: record.input,
-      cacheRead: record.cacheRead,
-      output,
-      sec,
-      ttftSec,
-      eventItlMs,
-      deltas: req.outputEvents,
-      decodeTps,
-      streamDecodeTps,
-    };
-    reqs.push(summary);
+    reqs.push(record);
 
     if (cur) {
       cur.reqs++;
       cur.output += output;
       cur.streamSec += sec;
-      if (decodeSec !== null && decodeSec > 0) {
-        cur.decodeSec += decodeSec;
+      // Turn decode totals follow the same server/events selection as the request; e2e fallbacks
+      // (no decode boundary, or a buffered burst) contribute nothing to decode time.
+      if (trusted(tpsSource) && metricSec > 0) {
+        cur.decodeSec += metricSec;
+        cur.decodeTokens += metricTokens;
         cur.streamDecodeTokens += output;
-        if (output > 1) cur.decodeTokens += output - 1;
       }
     }
     const tps = div(output, sec);
@@ -459,10 +659,7 @@ export default function (pi: ExtensionAPI) {
     const wallTps = div(cur.output, cur.wallSec);
     const decodeTps = div(cur.decodeTokens, cur.decodeSec);
     const streamDecodeTps = div(cur.streamDecodeTokens, cur.decodeSec);
-    ctx.ui.notify(
-      `turn ${turns.length}: ${cur.reqs} req, ${cur.output} tok out, ${f1(cur.streamSec)}s stream, ${f1(cur.activeWallSec)}s active wall (+${f1(cur.userWaitSec)}s user wait), ${rate(tps)} stream tok/s, ${rate(activeWallTps)} active-wall tok/s, decode ${rate(decodeTps)} AIPerf / ${rate(streamDecodeTps)} stream`,
-      "info",
-    );
+    // Turn metrics stay in the footer; /perf is the explicit detailed report.
     const record = {
       type: "turn",
       source: "pi-perf",

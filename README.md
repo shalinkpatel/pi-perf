@@ -12,17 +12,23 @@ From this repository checkout:
 pi install /path/to/pi-perf
 ```
 
-From git after pushing it somewhere:
+From GitHub (tracks the default branch; append `@v0.1.0` to pin a tag):
 
 ```bash
-pi install git:github.com/<you>/pi-perf@v0.1.0
+pi install git:github.com/shalinkpatel/pi-perf
 ```
+
+Then restart Pi. The footer shows `Turn TTFT / Turn TPS / Session TTFT / Session TPS` after the first request; `/perf` prints the detailed report. Remove with `pi remove git:github.com/shalinkpatel/pi-perf`.
 
 For a temporary trial without changing settings:
 
 ```bash
+pi -e git:github.com/shalinkpatel/pi-perf
+# or a local checkout
 pi -e /path/to/pi-perf
 ```
+
+Requirements: Pi with extension support (`@earendil-works/pi-coding-agent`), Node 20+ for `npm test`. No runtime dependencies.
 
 ## Use
 
@@ -33,10 +39,10 @@ pi -e /path/to/pi-perf
 The footer shows latest-request TTFT/TPS plus session mean TTFT and aggregate TPS:
 
 ```text
-Turn TTFT: 0.100 s • Turn TPS: 247.5 • Session TTFT: 0.150 s • Session TPS: 165.6
+Turn TTFT: 0.200 s • Turn TPS: 100.0 (e2e 72.9) • Session TTFT: 0.150 s • Session TPS: 165.6 (e2e 125.8)
 ```
 
-Footer TPS uses the AIPerf decode measurement, `(output - 1) / (latency - TTFT)`; the label omits “decode” for brevity. Labels are dim, TTFT values use the accent color, and TPS values use the success color. The footer updates after each request, when `/perf` runs, and after reload from persisted session entries.
+Footer TPS is decode TPS from a trustworthy timing source (see priority below) and reads `n/a` when there is none for that request, for example a stream that a proxy held and released in a burst. The `(e2e N)` value is end-to-end: server-reported output tokens / request latency including TTFT (session: summed tokens / summed latency). It cannot be inflated by buffering, so the two disagreeing by a wide margin means something between Pi and the model is holding the stream. Labels are dim, TTFT values use the accent color, and TPS values use the success color. The footer updates after each request, when `/perf` runs, and after reload or `/tree` navigation. Automatic turn metrics do not appear in the main chat window; `/perf` is the explicit detailed report.
 
 JSONL export is disabled by default.
 
@@ -67,15 +73,19 @@ PI_PERF_LOG=/tmp/pi-perf.jsonl pi
 PI_PERF_LOG=/tmp/pi-perf.jsonl PI_PERF_LOG_PAYLOADS=0 pi
 ```
 
-Legacy `PI_TPS_LOG`, `PI_TPS_LOG_PAYLOADS`, and the `tps.log` settings section remain supported. There is no `/tps` command alias.
+There is no `/tps` command alias.
 
 ## Timing definitions
 
 - Request latency: immediately before provider dispatch to last observed generated output.
 - TTFT: request start to first generated text, thinking, or tool-argument event.
 - TPS in `/perf`: server-reported output tokens / request latency, including TTFT.
-- Footer TPS and `decodeTps`: AIPerf-style `(output - 1) / (latency - TTFT)`.
-- Stream decode TPS: `output / (latency - TTFT)`, matching the Grafana board's stream convention.
+- Footer decode TPS, in priority order: provider `Server-Timing` decode metrics; a gateway's `*-sent-at` epoch header to the last delta on our clock (`tpsSource: anchored`, accepted only when the header falls inside our own request window so clock skew is bounded by a round trip); AIPerf-style event decode `(output - 1) / (latency - TTFT)`. `n/a` for buffered or single-event responses. The `(e2e N)` suffix is `output / latency`.
+- Response headers are matched by suffix, case-insensitively, so any gateway prefix works: `*-request-id`, `*-correlation-id`, `*-received-at` or `*-accepted-at` (epoch ms), `*-sent-at` (epoch ms), plus the `Server-Timing` names below. Nothing vendor-specific is assumed.
+- `serverTtftSec`: `sent-at - received-at` from gateway headers, the server-side time to first token. `headerDelaySec`: how long after `sent-at` the response headers reached us; anything beyond network latency is a proxy holding the stream. `anchoredSec`: the sent-at-to-last-delta window. Session decode excludes requests without a trustworthy decode source.
+- Provider-reported timing is extracted only from explicit token-generation names, such as `Server-Timing: llm-decode;dur=...` or headers ending in `llm-decode-duration-ms` / `llm-decode-tps`. Equivalent `model-decode` and `token-generation` names are accepted. Ambiguous names such as `image-decode` are ignored.
+- `decodeTps`: server-reported decode TPS when available, otherwise AIPerf-style event decode. Null when the event interval implies more than 1,000 tok/s, or more than 2.5x the running median for that model once it has three samples; both mean a proxy held the response and released it compressed, so the interval measured delivery, not decode (this produced the 40,000 tok/s and the 3-6x-too-high footer readings). Such records carry `buffered: true` and fall back to end-to-end TPS. Turn and session decode totals use the same server/events selection as the request and skip e2e fallbacks.
+- Stream decode TPS: `output / (latency - TTFT)`, the same window without AIPerf's N-1 correction; some serving dashboards use this convention.
 - Turn stream time: sum of provider request latencies.
 - Active turn wall: agent wall time including tools, excluding blocking user-input prompts.
 - Total turn wall: active wall plus user-input wait.
