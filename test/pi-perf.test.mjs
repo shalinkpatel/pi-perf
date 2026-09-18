@@ -7,11 +7,9 @@ import test from 'node:test';
 
 const { default: install } = await import(new URL('../extensions/pi-perf/index.ts', import.meta.url));
 
-const styledFooter = (turnTtft, turnDecode, sessionTtft, sessionDecode, turnE2e, sessionE2e) =>
-  `[dim]Turn TTFT:[/dim] [accent]${turnTtft}[/accent] [dim]•[/dim] ` +
-  `[dim]Turn TPS:[/dim] [success]${turnDecode}[/success] [dim](e2e ${turnE2e})[/dim] [dim]•[/dim] ` +
-  `[dim]Session TTFT:[/dim] [accent]${sessionTtft}[/accent] [dim]•[/dim] ` +
-  `[dim]Session TPS:[/dim] [success]${sessionDecode}[/success] [dim](e2e ${sessionE2e})[/dim]`;
+const styledFooter = (turnTtft, turnDecode, sessionTtft, sessionDecode) =>
+  `[dim]Turn:[/dim] [dim]TTFT[/dim] [accent]${turnTtft}[/accent] [dim]TPS[/dim] [success]${turnDecode}[/success] [dim]•[/dim] ` +
+  `[dim]Session:[/dim] [dim]TTFT[/dim] [accent]${sessionTtft}[/accent] [dim]TPS[/dim] [success]${sessionDecode}[/success]`;
 
 function harness(t, options = {}) {
   let now = 1000;
@@ -139,7 +137,7 @@ for (const [name, types] of [
     for (const key of ['sec', 'ttftSec', 'eventItlMs', 'deltas', 'output', 'streamDecodeTps', 'requestId']) assert.equal(persisted[key], r[key]);
     const turn = h.records().find(r => r.type === 'turn');
     assert.deepEqual([turn.reqs, turn.output, turn.streamSec, turn.wallSec, turn.activeWallSec, turn.userWaitSec, turn.tps, turn.activeWallTps, turn.wallTps, turn.decodeTps, turn.streamDecodeTps], [1, 100, 0.5, 1, 1, 0, 200, 100, 100, 247.5, 250]);
-    assert.deepEqual(h.statuses.at(-1), ['perf', styledFooter('0.100 s', '247.5', '0.100 s', '247.5', '200.0', '200.0')]);
+    assert.deepEqual(h.statuses.at(-1), ['perf', styledFooter('0.1s', '247.5', '0.1s', '247.5')]);
     await h.report();
     assert.equal(h.hasCommand('tps'), false);
     assert.match(h.notifications.at(-1), /100 tok out/);
@@ -159,7 +157,7 @@ test('single tool delta has TTFT but no decode interval', (t) => {
   assert.equal(r.effectiveTps, 5);
   assert.equal(r.tpsSource, 'e2e');
   assert.deepEqual([r.metricTokens, r.metricSec], [1, 0.2]);
-  assert.deepEqual(h.statuses.at(-1), ['perf', styledFooter('0.200 s', 'n/a', '0.200 s', 'n/a', '5.0', '5.0')]);
+  assert.deepEqual(h.statuses.at(-1), ['perf', styledFooter('0.2s', '-', '0.2s', '-')]);
 });
 
 test('buffered burst falls back to end-to-end TPS instead of dividing by dispatch jitter', (t) => {
@@ -179,7 +177,7 @@ test('buffered burst falls back to end-to-end TPS instead of dividing by dispatc
   assert.ok(r.effectiveTps < 100);
   const turn = h.records().find(r => r.type === 'turn');
   assert.equal(turn.decodeTps, null);
-  assert.match(h.statuses.at(-1)[1], /Turn TPS:\S* \S*n\/a\S* \S*\(e2e 43\.7\)/);
+  assert.match(h.statuses.at(-1)[1], /Turn:\S* \S*TTFT\S* \S*16\.0s\S* \S*TPS\S* \S*-\S* \S*•/);
   // A genuinely streamed short reply (11 tokens over 100 ms = 100 tok/s) keeps the events formula.
   const h2 = harness(t);
   h2.begin(1000);
@@ -214,7 +212,7 @@ test('a request delivered 3x faster than the model\'s running median is treated 
   const rs = h.records().filter(r => r.type === 'request');
   assert.deepEqual(rs.slice(0, 4).map(r => [r.buffered, Math.round(r.decodeTps)]), Array(4).fill([false, 100]));
   assert.deepEqual([rs[4].buffered, rs[4].tpsSource, Math.round(rs[4].effectiveTps)], [true, 'e2e', Math.round(945 / 16.7)]);
-  assert.match(h.statuses[4][1], /Turn TPS:\S* \S*n\/a\S* \S*\(e2e 56\.6\)/); // buffered request has no trusted decode
+  assert.match(h.statuses[4][1], /Turn:\S* \S*TTFT\S* \S*15\.3s\S* \S*TPS\S* \S*-\S* \S*•/); // buffered request has no trusted decode
   assert.deepEqual(rs.slice(5).map(r => [r.buffered, Math.round(r.decodeTps)]), Array(4).fill([false, 300]));
 });
 
@@ -233,7 +231,7 @@ test('gateway sent-at anchors the decode window when a downstream proxy holds th
   // Decode window is 2000 -> 12100 = 10.1 s, not the 100 ms delta interval.
   assert.deepEqual([r.tpsSource, r.buffered, r.anchoredSec, r.serverTtftSec, r.headerDelaySec], ['anchored', false, 10.1, 1, 10]);
   assert.ok(Math.abs(r.decodeTps - 200 / 10.1) < 1e-9);
-  assert.match(h.statuses.at(-1)[1], /Turn TPS:\S* \S*19\.8\S* \S*\(e2e 18\.1\)/);
+  assert.match(h.statuses.at(-1)[1], /Turn:\S* \S*TTFT\S* \S*11\.0s\S* \S*TPS\S* \S*19\.8\S* \S*•/);
 
   // A sent-at outside our request window (clock skew or a stale header) is ignored.
   const h2 = harness(t);
@@ -261,7 +259,7 @@ test('an aborted attempt is recorded but does not take over the footer or sessio
   const aborted = h.records().filter(r => r.type === 'request').at(-1);
   assert.deepEqual([aborted.output, aborted.stopReason, aborted.errorMessage, aborted.responseStatus, aborted.tpsSource], [0, 'aborted', 'Operation aborted', null, null]);
   assert.deepEqual(h.statuses.at(-1), before);
-  assert.deepEqual(h.statuses.at(-1), ['perf', styledFooter('0.100 s', '247.5', '0.100 s', '247.5', '200.0', '200.0')]);
+  assert.deepEqual(h.statuses.at(-1), ['perf', styledFooter('0.1s', '247.5', '0.1s', '247.5')]);
 });
 
 test('turn decode totals follow server timing; zero-output usage never yields negative rates', (t) => {
@@ -328,13 +326,13 @@ test('session_tree restores metrics from the newly selected branch', (t) => {
     { id: 'old-request', parentId: null, type: 'custom', customType: 'perf_request', data: { turn: 0, output: 10, sec: 1, ttftSec: 0.5, deltas: 2 } },
   );
   h.emit(1000, 'session_start', { reason: 'reload' });
-  assert.deepEqual(h.statuses.at(-1), ['perf', styledFooter('0.500 s', '18.0', '0.500 s', '18.0', '10.0', '10.0')]);
+  assert.deepEqual(h.statuses.at(-1), ['perf', styledFooter('0.5s', '18.0', '0.5s', '18.0')]);
   h.sessionEntries.length = 0;
   h.sessionEntries.push(
     { id: 'new-request', parentId: null, type: 'custom', customType: 'perf_request', data: { turn: 0, output: 20, sec: 2, ttftSec: 1, deltas: 2 } },
   );
   h.emit(2000, 'session_tree', { newLeafId: 'new-request', oldLeafId: 'old-request' });
-  assert.deepEqual(h.statuses.at(-1), ['perf', styledFooter('1.000 s', '19.0', '1.000 s', '19.0', '10.0', '10.0')]);
+  assert.deepEqual(h.statuses.at(-1), ['perf', styledFooter('1.0s', '19.0', '1.0s', '19.0')]);
 });
 
 test('agent_end updates the footer without notifying the main chat window', (t) => {
@@ -359,7 +357,7 @@ test('footer aggregates session TTFT and decode TPS across requests', (t) => {
   h.update(2700, 'text_delta');
   h.finish(2800, 51);
   // Turn: 51 tokens over 0.7 s e2e, 50 over 0.5 s decode. Session: 151/1.2 s e2e, 149/0.9 s decode.
-  assert.deepEqual(h.statuses.at(-1), ['perf', styledFooter('0.200 s', '100.0', '0.150 s', '165.6', '72.9', '125.8')]);
+  assert.deepEqual(h.statuses.at(-1), ['perf', styledFooter('0.2s', '100.0', '0.2s', '165.6')]);
 });
 
 test('tool execution excluded, follow-up request resets timing, turn sums requests', (t) => {
@@ -463,7 +461,7 @@ test('reload restores active-branch metrics and footer from persisted session en
     ],
   });
   h.emit(1000, 'session_start', { reason: 'reload' });
-  assert.deepEqual(h.statuses.at(-1), ['perf', styledFooter('0.100 s', '247.5', '0.100 s', '247.5', '200.0', '200.0')]);
+  assert.deepEqual(h.statuses.at(-1), ['perf', styledFooter('0.1s', '247.5', '0.1s', '247.5')]);
   await h.report();
   assert.match(h.notifications.at(-1), /100 tok out/);
   assert.match(h.notifications.at(-1), /1\.0s active wall \(\+0\.0s user wait\)/);
