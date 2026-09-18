@@ -101,10 +101,8 @@ const getAgentDir = () => process.env.PI_CODING_AGENT_DIR ?? join(homedir(), CON
 const expandTildePath = (path: string) =>
   path === "~" ? homedir() : path.startsWith("~/") || path.startsWith("~\\") ? join(homedir(), path.slice(2)) : path;
 const f1 = (n: number) => n.toFixed(1);
-const f3 = (n: number) => n.toFixed(3);
 const div = (a: number | null, b: number) => (a === null || b <= 0 ? null : a / b);
-const rate = (n: number | null) => (n === null ? "n/a" : f1(n));
-const seconds = (n: number | null) => (n === null ? "n/a" : `${f3(n)} s`);
+const rate = (n: number | null) => (n === null ? "-" : f1(n));
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
@@ -343,21 +341,16 @@ export default function (pi: ExtensionAPI) {
     const session = sessionStats();
     const color = (name: string, text: string) => ctx.ui.theme?.fg?.(name, text) ?? text;
     const label = (text: string) => color("dim", text);
-    const separator = color("dim", "•");
-    // Headline is decode TPS from a trustworthy source (Server-Timing, gateway anchor, or clean
-    // event timing), n/a otherwise. End-to-end TPS (tokens / request latency, immune to stream
-    // buffering) always follows in parentheses.
-    const tps = (decode: number | null, e2e: number | null) =>
-      `${color("success", rate(decode))} ${label(`(e2e ${rate(e2e)})`)}`;
+    // `Turn: TTFT 4.1s TPS 112.2 • Session: TTFT 5.6s TPS 156.3`. TPS is decode from a
+    // trustworthy source (Server-Timing, gateway anchor, clean event timing), `-` otherwise;
+    // end-to-end rates stay in the records and /perf.
+    const group = (name: string, ttft: number | null, decode: number | null) =>
+      `${label(`${name}:`)} ${label("TTFT")} ${color("accent", ttft === null ? "-" : `${f1(ttft)}s`)} ` +
+      `${label("TPS")} ${color("success", rate(decode))}`;
     const latestDecode = trusted(latest.tpsSource) ? latest.decodeTps : null;
     ctx.ui.setStatus(
       "perf",
-      [
-        `${label("Turn TTFT:")} ${color("accent", seconds(latest.ttftSec))}`,
-        `${label("Turn TPS:")} ${tps(latestDecode, div(latest.output, latest.sec))}`,
-        `${label("Session TTFT:")} ${color("accent", seconds(session.ttftSec))}`,
-        `${label("Session TPS:")} ${tps(session.decodeTps, session.tps)}`,
-      ].join(` ${separator} `),
+      `${group("Turn", latest.ttftSec, latestDecode)} ${color("dim", "•")} ${group("Session", session.ttftSec, session.decodeTps)}`,
     );
   };
   const finite = (value: unknown, fallback = 0) =>
