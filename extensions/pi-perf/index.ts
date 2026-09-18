@@ -313,6 +313,7 @@ export default function (pi: ExtensionAPI) {
     let sec = 0;
     let output = 0;
     for (const req of reqs) {
+      if (req.output === 0) continue; // aborted / errored attempts carry no throughput signal
       if (req.ttftSec !== null) {
         ttftSec += req.ttftSec;
         ttftCount++;
@@ -332,7 +333,9 @@ export default function (pi: ExtensionAPI) {
     };
   };
   const updateFooterStatus = (ctx: any) => {
-    const latest = reqs.at(-1);
+    // The footer shows the latest request that produced tokens; a failed attempt keeps the
+    // previous reading rather than replacing it with n/a.
+    const latest = reqs.findLast((r) => r.output > 0);
     if (!latest) {
       ctx.ui.setStatus("perf", undefined);
       return;
@@ -591,6 +594,8 @@ export default function (pi: ExtensionAPI) {
       messageEndWallMs,
       messageEndPerfMs,
       responseStatus: finalResponse?.status ?? null,
+      stopReason: e.message.stopReason ?? null,
+      errorMessage: e.message.errorMessage ?? null,
       clientRequestId: req.clientRequestId,
       clientCorrelationId: req.clientCorrelationId,
       requestId: finalResponse?.requestId ?? null,
@@ -630,8 +635,7 @@ export default function (pi: ExtensionAPI) {
         cur.streamDecodeTokens += output;
       }
     }
-    const tps = div(output, sec);
-    if (tps !== null) updateFooterStatus(ctx);
+    updateFooterStatus(ctx);
     try { pi.appendEntry("perf_request", record); } catch {}
     writeLog(record, ctx);
   });

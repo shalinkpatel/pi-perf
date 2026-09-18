@@ -247,6 +247,23 @@ test('gateway sent-at anchors the decode window when a downstream proxy holds th
   assert.deepEqual([r2.tpsSource, r2.anchoredSec, r2.serverTtftSec, r2.decodeTps], ['events', null, null, 250]);
 });
 
+test('an aborted attempt is recorded but does not take over the footer or session sums', (t) => {
+  const h = harness(t);
+  h.begin(1000);
+  h.update(1100, 'text_delta');
+  h.update(1500, 'text_delta');
+  h.finish(1500, 100);
+  const before = h.statuses.at(-1);
+  // Pi aborts a hung attempt: no response headers, no deltas, usage all zero.
+  h.emit(2000, 'turn_start', { turnIndex: 1, timestamp: 2000 });
+  h.emit(2000, 'before_provider_request', { payload: {} });
+  h.emit(13000, 'message_end', { message: { role: 'assistant', stopReason: 'aborted', errorMessage: 'Operation aborted', usage: { input: 0, output: 0 } } });
+  const aborted = h.records().filter(r => r.type === 'request').at(-1);
+  assert.deepEqual([aborted.output, aborted.stopReason, aborted.errorMessage, aborted.responseStatus, aborted.tpsSource], [0, 'aborted', 'Operation aborted', null, null]);
+  assert.deepEqual(h.statuses.at(-1), before);
+  assert.deepEqual(h.statuses.at(-1), ['perf', styledFooter('0.100 s', '247.5', '0.100 s', '247.5', '200.0', '200.0')]);
+});
+
 test('turn decode totals follow server timing; zero-output usage never yields negative rates', (t) => {
   const h = harness(t);
   h.emit(1000, 'agent_start');
