@@ -47,7 +47,7 @@ function harness(t, options = {}) {
     rmSync(dir, { recursive: true, force: true });
   });
   const handlers = new Map(), commands = new Map();
-  const entries = [], notifications = [], statuses = [];
+  const entries = [], notifications = [], statuses = [], widgets = [];
   const sessionEntries = options.sessionEntries ?? [];
   const ctx = {
     cwd,
@@ -61,6 +61,7 @@ function harness(t, options = {}) {
     ui: {
       theme: { fg: (color, text) => `[${color}]${text}[/${color}]` },
       setStatus: (key, text) => statuses.push([key, text]),
+      setWidget: (key, content, options) => widgets.push([key, content, options]),
       notify: (text) => notifications.push(text),
     },
   };
@@ -91,7 +92,7 @@ function harness(t, options = {}) {
     message: { role: 'assistant', model, usage: { input: 20, cacheRead: 10, output } },
   });
   return {
-    dir, log, emit, update, begin, finish, entries, notifications, statuses,
+    dir, log, emit, update, begin, finish, entries, notifications, statuses, widgets,
     records: () => existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse) : [],
     report: () => commands.get('perf').handler('', ctx),
     hasCommand: (name) => commands.has(name),
@@ -467,4 +468,14 @@ test('reload restores active-branch metrics and footer from persisted session en
   await h.report();
   assert.match(h.notifications.at(-1), /100 tok out/);
   assert.match(h.notifications.at(-1), /1\.0s active wall \(\+0\.0s user wait\)/);
+});
+
+test('placement setting moves the reading from the shared status line to its own widget line', (t) => {
+  const h = harness(t, { settings: { piPerf: { placement: 'belowEditor' } } });
+  h.begin(1000);
+  h.update(1100, 'text_delta', 'a');
+  h.update(1500, 'text_delta', 'b');
+  h.finish(1500, 100);
+  assert.equal(h.statuses.length, 0);
+  assert.deepEqual(h.widgets.at(-1), ['perf', [styledFooter('0.1s', '247.5', '0.1s', '247.5')], { placement: 'belowEditor' }]);
 });
