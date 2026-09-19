@@ -46,6 +46,12 @@ Turn is the latest request; Session is the mean TTFT and aggregate decode TPS ac
 
 The footer reflects the latest request that produced tokens; an aborted or errored attempt is recorded (with `stopReason` and `errorMessage`) but does not replace the reading or count toward session sums. Footer TPS is decode TPS from a trustworthy timing source (see priority below) and falls back to the dimmed `N e2e` form when there is none for that request. End-to-end TPS (server-reported output tokens / request latency including TTFT) is in every record and in `/perf`; it cannot be inflated by buffering, so a wide gap between it and decode TPS means something between Pi and the model is holding the stream. Labels are dim, TTFT values use the accent color, and TPS values use the success color. The footer updates after each request, when `/perf` runs, and after reload or `/tree` navigation. Automatic turn metrics do not appear in the main chat window; `/perf` is the explicit detailed report.
 
+The reading shares Pi's one-line footer status with every other extension and is truncated with them. To give it its own line next to the editor instead, set `piPerf.placement` to `belowEditor` (or `aboveEditor`) in `~/.pi/agent/settings.json` or a trusted project's `.pi/settings.json`; the default `status` keeps it in the footer.
+
+```json
+{ "piPerf": { "placement": "belowEditor" } }
+```
+
 JSONL export is disabled by default.
 
 ## Optional JSONL export

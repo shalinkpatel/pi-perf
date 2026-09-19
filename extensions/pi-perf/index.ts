@@ -13,6 +13,9 @@
 // JSONL export is disabled by default. Enable it in ~/.pi/agent/settings.json:
 //   { "piPerf": { "log": { "enabled": true, "path": "pi-perf.jsonl", "includePayloads": false } } }
 // A trusted project's .pi/settings.json can override the same nested object.
+// The footer status line is shared with every other extension and truncated to one line;
+// { "piPerf": { "placement": "belowEditor" } } (or "aboveEditor") moves the metrics to their
+// own widget line next to the editor instead.
 // PI_PERF_LOG=/path/to/file.jsonl is a per-process override; it includes payloads by
 // default, set PI_PERF_LOG_PAYLOADS=0 to disable them.
 // View history with /perf.
@@ -256,6 +259,24 @@ function readLogSettings(path: string, baseDir: string): Partial<LogConfig> {
   }
 }
 
+type Placement = "status" | "aboveEditor" | "belowEditor";
+
+function readPlacement(path: string): Placement | undefined {
+  try {
+    const settings: unknown = JSON.parse(readFileSync(path, "utf8"));
+    const raw = isObject(settings) && isObject(settings.piPerf) ? settings.piPerf.placement : undefined;
+    return raw === "status" || raw === "aboveEditor" || raw === "belowEditor" ? raw : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function placement(ctx?: any): Placement {
+  const global = readPlacement(join(getAgentDir(), "settings.json"));
+  const project = ctx?.isProjectTrusted?.() ? readPlacement(join(ctx.cwd, CONFIG_DIR_NAME, "settings.json")) : undefined;
+  return project ?? global ?? "status";
+}
+
 function logConfig(ctx?: any): LogConfig {
   const envPath = process.env.PI_PERF_LOG;
   if (envPath) {
@@ -330,12 +351,17 @@ export default function (pi: ExtensionAPI) {
       decodeTps: metricSec > 0 && metricTokens > 0 ? metricTokens / metricSec : null,
     };
   };
+  const show = (ctx: any, text: string | undefined) => {
+    const where = placement(ctx);
+    if (where === "status") ctx.ui.setStatus("perf", text);
+    else ctx.ui.setWidget("perf", text === undefined ? undefined : [text], { placement: where });
+  };
   const updateFooterStatus = (ctx: any) => {
     // The footer shows the latest request that produced tokens; a failed attempt keeps the
     // previous reading rather than replacing it with n/a.
     const latest = reqs.findLast((r) => r.output > 0);
     if (!latest) {
-      ctx.ui.setStatus("perf", undefined);
+      show(ctx, undefined);
       return;
     }
     const session = sessionStats();
@@ -351,8 +377,8 @@ export default function (pi: ExtensionAPI) {
       `${label(`${name}:`)} ${label("TTFT")} ${color("accent", ttft === null ? "-" : `${f1(ttft)}s`)} ` +
       `${label("TPS")} ${tps(decode, e2e)}`;
     const latestDecode = trusted(latest.tpsSource) ? latest.decodeTps : null;
-    ctx.ui.setStatus(
-      "perf",
+    show(
+      ctx,
       `${group("Turn", latest.ttftSec, latestDecode, div(latest.output, latest.sec))} ${color("dim", "•")} ` +
       group("Session", session.ttftSec, session.decodeTps, session.tps),
     );
